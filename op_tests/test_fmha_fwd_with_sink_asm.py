@@ -14,8 +14,12 @@ Sink convention
 ---------------
 `sink` ([q_head_num] fp32) is a per-Q-head logit in the SAME scaled domain as
 Q·K^T * softmax_scale; it acts as a zero-value virtual KV column and is passed
-to the kernel verbatim (no host-side scaling).  D64 kernels read it; D128
-kernels ignore it (pass None).
+to the kernel verbatim (no host-side scaling).  D64 kernels read it; D128 and
+D256 kernels ignore it (pass None).
+
+Candidates: `asm` calls the ASM kernel through the ops layer; `public` is what
+flash_attn_func runs, which offers the call to FlyDSL first, so it may be served
+by another backend.
 
 Layout: the API only accepts bshd shape ([b, s, h, d]).  To exercise the
 kernel's stride handling for sbhd / bhsd memory, qkv are allocated in the
@@ -63,6 +67,7 @@ def run_torch(q, k, v, *, is_causal, sink=None):
     scale = 1.0 / math.sqrt(d)
     scores = torch.einsum("bshd,bkhd->bhsk", qf, kf) * scale
     if is_causal:
+        # bottom-right aligned; with sq > sk the first sq - sk rows see no key
         m = torch.triu(
             torch.ones(sq, sk, dtype=torch.bool, device=q.device), sk - sq + 1
         )
@@ -73,10 +78,14 @@ def run_torch(q, k, v, *, is_causal, sink=None):
         max_total = torch.maximum(max_attn, sink_bhs)
     else:
         max_total = max_attn
+    # -inf only on rows that see no key: subtract 0 there, so O = 0, LSE = -inf
+    max_total = torch.where(torch.isinf(max_total), 0.0, max_total)
     denom = torch.exp(scores - max_total.unsqueeze(-1)).sum(dim=-1)
     if sink is not None:
         denom = denom + torch.exp(sink_bhs - max_total)
-    probs = torch.exp(scores - max_total.unsqueeze(-1)) / denom.unsqueeze(-1)
+    probs = torch.exp(scores - max_total.unsqueeze(-1)) / torch.where(
+        denom > 0, denom, 1.0
+    ).unsqueeze(-1)
     out = torch.einsum("bhsk,bkhd->bshd", probs, vf).to(q.dtype)
     lse = torch.log(denom) + max_total
     return out, lse
@@ -158,8 +167,9 @@ def _flops_bytes(batch, hq, hk, sq, sk, d, is_causal, esz):
 # ---------------------------------------------------------------------------
 
 # Correctness shapes (torch reference is feasible here).  hq=64; hk=8 for D64
-# and hk=4 for D128 (GQA ratios 8 / 16).  Non-causal (mask=0) kernels require
-# sk % 256 == 0 — non-aligned sk rows are causal-only (filtered in the sweep).
+# and hk=4 for D128 (GQA ratios 8 / 16).  Non-causal (mask=0) D64/D128 kernels
+# require sk % 256 == 0 — non-aligned sk rows are causal-only for them (filtered
+# in the sweep); D256 tiles KV by 128 with a border mask and takes any sk.
 # (head_dim, hq, hk, sq, sk, batch)
 _CORRECTNESS_SHAPES = [
     (64, 64, 8, 128, 2048, 1),  # D64  aligned
@@ -172,23 +182,37 @@ _CORRECTNESS_SHAPES = [
     (128, 64, 4, 128, 2300, 1),  # D128 kv-unaligned -> causal
     (64, 64, 8, 8192, 8192, 1),  # D64  perf-sized, aligned
     (128, 64, 4, 4096, 4096, 1),  # D128 perf-sized, aligned
+    (256, 16, 4, 128, 2048, 1),  # D256 aligned
+    (256, 16, 4, 128, 2048, 2),
+    (256, 16, 4, 130, 2048, 1),  # D256 q-unaligned
+    (256, 16, 4, 128, 2300, 1),  # D256 kv-unaligned (non-causal too)
+    (256, 16, 4, 1000, 300, 2),  # D256 sq > sk: causal rows that see no key
+    (256, 16, 4, 300, 1000, 3),  # D256 sq < sk
+    (256, 16, 16, 4096, 4096, 1),  # D256 perf-sized
+    (256, 64, 64, 2304, 2304, 1),  # D256 kv heads x kv length > 2^17: no remap_xy
 ]
 
-# Perf-only shapes; sq == sk.  hq=64, hk=8 (D64) / 4 (D128), batch=1, sbhd.
+# Perf-only shapes; sq == sk, sbhd.
 # The torch reference is O(s^2) in memory (e.g. 32768 -> ~256 GB of scores) so
 # these are timed but NOT correctness-checked here (use _CORRECTNESS_SHAPES).
-# (head_dim, seqlen)
+# (head_dim, hq, hk, seqlen, batch)
 _PERF_SHAPES = [
-    (64, 1024),
-    (64, 4096),
-    (64, 8192),
-    (64, 16384),
-    (64, 32768),
-    (128, 1024),
-    (128, 2048),
-    (128, 4096),
-    (128, 8192),
-    (128, 16384),
+    (64, 64, 8, 1024, 1),
+    (64, 64, 8, 4096, 1),
+    (64, 64, 8, 8192, 1),
+    (64, 64, 8, 16384, 1),
+    (64, 64, 8, 32768, 1),
+    (128, 64, 4, 1024, 1),
+    (128, 64, 4, 2048, 1),
+    (128, 64, 4, 4096, 1),
+    (128, 64, 4, 8192, 1),
+    (128, 64, 4, 16384, 1),
+    (256, 16, 16, 4096, 1),
+    (256, 16, 16, 16384, 1),
+    (256, 32, 4, 8192, 1),
+    (256, 32, 32, 16000, 4),  # mi455x-opbench attn/uniform/B4L16000/h32d256
+    (256, 32, 1, 16384, 1),  # MQA
+    (256, 64, 64, 1024, 16),
 ]
 
 
@@ -214,14 +238,20 @@ def test_fmha_fwd_with_sink_asm(
         batch, hq, hk, sq, sk, head_dim, is_causal, q.element_size()
     )
 
-    # The model calls the public dispatcher (flash_attn_func) → asm path.
     candidates = {
-        "asm": lambda: run_kernel(
-            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public"
+        name: lambda via=via: run_kernel(
+            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via=via
         )
+        for name, via in (("asm", "ops"), ("public", "public"))
     }
 
     ret = {"gfx": get_gfx()}
+    # Rows that see no key (causal, sq > sk) have O = 0 and LSE = -inf (log of an
+    # empty sum); the ASM entry must return exactly that.  flash_attn_func may be
+    # served by FlyDSL, Triton or CK, depending on ENABLE_CK and the layout, and
+    # Triton writes LSE = 0 on those rows, so the public LSE is compared on rows
+    # that see a key only (O is compared on every row).
+    has_key = torch.isfinite(ref_lse)
     for name, fn in candidates.items():
         (out, lse), us = run_perftest(fn)
         ret[f"{name} us"] = us
@@ -234,9 +264,12 @@ def test_fmha_fwd_with_sink_asm(
             atol=1e-2,
             msg=f"{name} O d={head_dim} c={is_causal}",
         )
+        ref_l, lse_l = (
+            (ref_lse[has_key], lse[has_key]) if name == "public" else (ref_lse, lse)
+        )
         ret[f"{name} err(LSE)"] = checkAllclose(
-            ref_lse.to(dtypes.fp32),
-            lse.to(dtypes.fp32),
+            ref_l.to(dtypes.fp32),
+            lse_l.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
             msg=f"{name} LSE d={head_dim} c={is_causal}",
@@ -256,9 +289,10 @@ def test_fmha_fwd_with_sink_asm_perf(head_dim, hq, hk, sq, sk, batch, is_causal,
     )
 
     candidates = {
-        "asm": lambda: run_kernel(
-            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via="public"
+        name: lambda via=via: run_kernel(
+            q, k, v, scale=scale, is_causal=is_causal, sink=sink, via=via
         )
+        for name, via in (("asm", "ops"), ("public", "public"))
     }
 
     ret = {"gfx": get_gfx()}
@@ -286,9 +320,9 @@ def main():
         "--head_dim",
         type=int,
         nargs="*",
-        choices=[64, 128],
-        default=[64, 128],
-        help="head dim(s) to test (default: 64 128)",
+        choices=[64, 128, 256],
+        default=[64, 128, 256],
+        help="head dim(s) to test (default: 64 128 256)",
     )
     parser.add_argument(
         "-c",
@@ -327,7 +361,8 @@ def main():
         for is_causal, layout, init in itertools.product(
             causal_modes, args.layout, args.init
         ):
-            if not is_causal and sk % 256 != 0:  # mask=0 kernel needs sk%256==0
+            # mask=0 D64/D128 kernels need sk%256==0
+            if not is_causal and sk % 256 != 0 and head_dim != 256:
                 continue
             df.append(
                 test_fmha_fwd_with_sink_asm(
@@ -342,14 +377,13 @@ def main():
 
     # ---- perf-only table (large shapes; ref infeasible) ----
     df = []
-    for head_dim, seqlen in _PERF_SHAPES:
+    for head_dim, hq, hk, seqlen, batch in _PERF_SHAPES:
         if head_dim not in args.head_dim:
             continue
-        hk = 8 if head_dim == 64 else 4
         for is_causal, init in itertools.product(causal_modes, args.init):
             df.append(
                 test_fmha_fwd_with_sink_asm_perf(
-                    head_dim, 64, hk, seqlen, seqlen, 1, is_causal, init
+                    head_dim, hq, hk, seqlen, seqlen, batch, is_causal, init
                 )
             )
     df = pd.DataFrame(df)

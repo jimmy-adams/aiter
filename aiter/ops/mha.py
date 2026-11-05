@@ -691,7 +691,7 @@ def fmha_fwd_with_sink_varlen_asm(
 
     Contract details:
       * D64 / D128 take no strides: q/k/v are made dense, `out` must be dense.
-      * D192x128 takes strides: q/k/v/out are used in place as views; the
+      * D192x128 and D256 take strides: q/k/v/out are used in place as views; the
         dispatchers only send tensors `_can_impl_fmha_varlen_asm_d192_strides` accepts.
       * `max_seqlen_q` is the maximum per-batch Q sequence length (caller-
         supplied, e.g. flash_attn_varlen convention) -- it sets the launch tile
@@ -702,7 +702,7 @@ def fmha_fwd_with_sink_varlen_asm(
         allocated even when `return_lse=False`; in that case ignore the result.
     """
     require_gfx1250_asm("fmha_fwd_with_sink_varlen_asm")
-    strided = q.size(-1) == 192 and v.size(-1) == 128
+    strided = (q.size(-1), v.size(-1)) in ((192, 128), (256, 256))
     if not strided:
         q, k, v = (x.contiguous() for x in (q, k, v))
     cu_seqlens_q = cu_seqlens_q.to(torch.int32).contiguous()
@@ -735,12 +735,28 @@ def fmha_fwd_with_sink_varlen_asm(
     return out, lse
 
 
+def _can_impl_fmha_fwd_asm_d256_strides(q, k, v, out=None) -> bool:
+    """True if the batch-mode D256 kernels can address the bshd q/k/v (and `out`)
+    views (mirrors the C++ check): unit last-dim stride, token stride in (0, 2^24)
+    bytes, head and batch strides in (0, 2^31) bytes; a dim of size 1 is never
+    stepped, so its stride is free."""
+    limits = (0x7FFFFFFF, (1 << 24) - 1, 0x7FFFFFFF)  # batch, seq, head
+    for x in (q, k, v) if out is None else (q, k, v, out):
+        if x.stride(-1) != 1:
+            return False
+        esz = x.element_size()
+        for n, s, lim in zip(x.shape[:3], x.stride()[:3], limits):
+            if n > 1 and not 0 < s * esz <= lim:
+                return False
+    return True
+
+
 def _can_impl_fmha_varlen_asm_d192_strides(
     q, k, v, out=None, dense_last_dim_later=False
 ) -> bool:
-    """True if the D192x128 kernels can use q/k/v (and `out`) in place (mirrors the
-    C++ check): unit last-dim stride, token stride in (0, 2^24) bytes, head stride
-    in (0, 2^31) bytes.
+    """True if the D192x128 / D256 kernels can use q/k/v (and `out`) in place
+    (mirrors the C++ check): unit last-dim stride, token stride in (0, 2^24) bytes,
+    head stride in (0, 2^31) bytes.
 
     dense_last_dim_later: skip the last-dim check; `_flash_attn_varlen_forward`
     fixes it with `maybe_contiguous` and checks again.
@@ -931,17 +947,17 @@ def _select_gfx1250_fmha_fwd_varlen_asm(
         return 0
     hdim_q, hdim_v = q.shape[-1], v.shape[-1]
     if q.dtype == dtypes.bf16:
-        # fmha_fwd_with_sink_varlen_asm: D64 / D128 dense, D192x128 strided.
+        # fmha_fwd_with_sink_varlen_asm: D64 / D128 dense, D192x128 / D256 strided.
         if q_descale is not None or k_descale is not None or v_descale is not None:
             return 0
-        if hdim_q == 192 and hdim_v == 128:
+        if (hdim_q, hdim_v) in ((192, 128), (256, 256)):
             strided = True
         elif hdim_q in (64, 128) and hdim_v == hdim_q:
             strided = False
         else:
             return 0
         # Sink logits: the D64 binaries always read the sink buffer (a null one
-        # would be dereferenced); the D128 / D192x128 binaries never read it.
+        # would be dereferenced); the D128 / D192x128 / D256 binaries never read it.
         if (sink_ptr is not None) != (hdim_q == 64):
             return 0
         kind = _GFX1250_VARLEN_ASM_BF16
@@ -2229,7 +2245,7 @@ def _flash_attn_forward(
         # (per-Q-head fp32) supported; sink-token (sink_size) not supported.
         ret = get_gfx() in ("gfx1250", "gfx1250-strict") and is_gfx1250_asm_supported()
         ret = ret and (q.dtype == dtypes.bf16)
-        ret = ret and (hdim_q in (64, 128))
+        ret = ret and (hdim_q in (64, 128, 256))
         ret = ret and (hdim_v == hdim_q)
         ret = ret and (nhead_q % nhead_k == 0)
         ret = ret and (not swa)
@@ -2252,10 +2268,15 @@ def _flash_attn_forward(
         #   binary would dereference.  To preserve flash_attn_func's documented
         #   `sink_ptr is None` semantics we keep requiring an explicit sink for
         #   D64 here and fall back to CK otherwise.
-        if hdim_q == 128:
+        #
+        #   D256 kernels compile ENABLE_SINK=0 like D128, and take only the
+        #   strides `_can_impl_fmha_fwd_asm_d256_strides` accepts.
+        if hdim_q in (128, 256):
             ret = ret and (sink_ptr is None)
         elif hdim_q == 64:
             ret = ret and (sink_ptr is not None)
+        if hdim_q == 256:
+            ret = ret and _can_impl_fmha_fwd_asm_d256_strides(q, k, v, out)
         return ret
 
     def can_impl_fmha_fwd_mxfp8_asm():
